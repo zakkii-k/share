@@ -26,9 +26,9 @@ COPY sftpctl /usr/local/bin/sftpctl
 COPY healthcheck.sh /usr/local/bin/healthcheck.sh
 
 RUN chmod 0755 \
-      /usr/local/bin/entrypoint.sh \
-      /usr/local/bin/sftpctl \
-      /usr/local/bin/healthcheck.sh
+    /usr/local/bin/entrypoint.sh \
+    /usr/local/bin/sftpctl \
+    /usr/local/bin/healthcheck.sh
 
 EXPOSE 22001-22100
 
