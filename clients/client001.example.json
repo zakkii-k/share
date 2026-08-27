@@ -1,0 +1,12 @@
+{
+  "user": "client001",
+  "enabled": true,
+  "port": 22001,
+  "max_file_mb": 350,
+  "allowed_ips": [
+    "203.0.113.10/32"
+  ],
+  "public_keys": [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIReplaceWithARealPublicKey client001"
+  ]
+}
