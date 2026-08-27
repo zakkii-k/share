@@ -3,17 +3,29 @@ services:
     build:
       context: ./sftp
     container_name: openssh-sftp
+
     environment:
       PORT_START: "22001"
       PORT_END: "22100"
+
+      # 10ポート × 10 sshd = 100クライアント
+      PORTS_PER_SHARD: "10"
+      SHARD_COUNT: "10"
+
       UID_BASE: "20000"
+
+    # Docker側では最初から範囲をpublishしておく。
+    # sshd自体は、JSONに存在するポートしかlistenしない。
     ports:
       - "22001-22100:22001-22100"
+
     volumes:
       - ./clients:/config/clients
       - sftp_state:/config/state
       - sftp_data:/data
+
     restart: unless-stopped
+
     healthcheck:
       test: ["CMD-SHELL", "/usr/local/bin/healthcheck.sh"]
       interval: 10s

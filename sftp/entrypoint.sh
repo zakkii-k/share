@@ -1,8 +1,7 @@
 #!/bin/sh
 set -eu
 
-PORT_START="${PORT_START:-22001}"
-PORT_END="${PORT_END:-22100}"
+SHARD_COUNT="${SHARD_COUNT:-10}"
 
 mkdir -p \
   /run/sshd \
@@ -10,39 +9,104 @@ mkdir -p \
   /config/state \
   /config/host_keys \
   /etc/sftp/authorized_keys \
-  /etc/ssh/sshd_config.d \
+  /etc/security/limits.d \
   /data
 
+#
+# Host key
+#
+
 if [ ! -s /config/host_keys/ssh_host_ed25519_key ]; then
-  ssh-keygen -q -t ed25519 -N "" \
+  ssh-keygen \
+    -q \
+    -t ed25519 \
+    -N "" \
     -f /config/host_keys/ssh_host_ed25519_key
 fi
 
 if [ ! -s /config/host_keys/ssh_host_rsa_key ]; then
-  ssh-keygen -q -t rsa -b 3072 -N "" \
+  ssh-keygen \
+    -q \
+    -t rsa \
+    -b 3072 \
+    -N "" \
     -f /config/host_keys/ssh_host_rsa_key
 fi
 
 chmod 600 /config/host_keys/ssh_host_*_key
 chmod 644 /config/host_keys/ssh_host_*.pub
 
-# 22001-22100 を最初からlistenする
-: > /run/sftp-ports.conf
+#
+# JSON → user / PAM / authorized_keys / sshd configs
+#
 
-p="$PORT_START"
-while [ "$p" -le "$PORT_END" ]; do
-  echo "Port $p" >> /run/sftp-ports.conf
-  p=$((p + 1))
-done
-
-# Include対象を先に作成
-touch /etc/ssh/sshd_config.d/90-clients.conf
-
-# JSONからユーザー設定を復元
 /usr/local/bin/sftpctl apply-all
 
-# sshd設定チェック
-/usr/sbin/sshd -t -f /etc/ssh/sshd_config
+#
+# 10個のsshdを起動
+#
 
-# foregroundでsshd起動
-exec /usr/sbin/sshd -D -e -f /etc/ssh/sshd_config
+i=0
+
+while [ "$i" -lt "$SHARD_COUNT" ]; do
+
+  CONFIG="/run/sshd/shard-${i}.conf"
+  PIDFILE="/run/sshd/shard-${i}.child.pid"
+
+  echo "starting sshd shard=${i}"
+
+  /usr/sbin/sshd \
+    -D \
+    -e \
+    -f "$CONFIG" &
+
+  pid=$!
+
+  echo "$pid" > "$PIDFILE"
+
+  i=$((i + 1))
+done
+
+#
+# コンテナ停止時に全sshdを終了
+#
+
+shutdown() {
+  echo "stopping sshd shards"
+
+  for f in /run/sshd/shard-*.child.pid; do
+    [ -e "$f" ] || continue
+
+    pid="$(cat "$f")"
+
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+
+  wait || true
+  exit 0
+}
+
+trap shutdown TERM INT
+
+#
+# 簡易supervisor
+#
+# sshdのどれかが死んだらコンテナも落とす。
+# Docker restart policyで再構築する。
+#
+
+while :; do
+
+  for f in /run/sshd/shard-*.child.pid; do
+    [ -e "$f" ] || continue
+
+    pid="$(cat "$f")"
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "ERROR: sshd process died: pid=$pid" >&2
+      exit 1
+    fi
+  done
+
+  sleep 5
+done

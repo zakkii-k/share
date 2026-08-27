@@ -2,19 +2,23 @@
 set -eu
 
 CLIENT_DIR="${CLIENT_DIR:-/config/clients}"
+
 AUTH_KEYS_DIR="/etc/sftp/authorized_keys"
 LIMITS_DIR="/etc/security/limits.d"
 DATA_DIR="/data"
-CLIENT_RULES="/etc/ssh/sshd_config.d/90-clients.conf"
-SSHD_CONFIG="/etc/ssh/sshd_config"
+
 GROUP="sftp-clients"
 
 PORT_START="${PORT_START:-22001}"
 PORT_END="${PORT_END:-22100}"
+
+PORTS_PER_SHARD="${PORTS_PER_SHARD:-10}"
+SHARD_COUNT="${SHARD_COUNT:-10}"
+
 UID_BASE="${UID_BASE:-20000}"
 
 die() {
-  echo "sftpctl: $*" >&2
+  echo "sftpctl: ERROR: $*" >&2
   exit 1
 }
 
@@ -23,89 +27,126 @@ log() {
 }
 
 require_root() {
-  [ "$(id -u)" -eq 0 ] || die "must run as root inside the container"
+  [ "$(id -u)" -eq 0 ] || die "must run as root"
 }
 
-valid_user() {
-  printf '%s' "$1" | grep -Eq '^[a-z_][a-z0-9_-]{0,30}$'
-}
-
-json_required_string() {
-  file="$1"
-  expr="$2"
-  value="$(jq -er "$expr | select(type == \"string\" and length > 0)" "$file")" \
-    || die "$file: invalid $expr"
-  printf '%s' "$value"
-}
-
-json_required_int() {
-  file="$1"
-  expr="$2"
-  value="$(jq -er "$expr | select(type == \"number\" and floor == .)" "$file")" \
-    || die "$file: invalid $expr"
-  printf '%s' "$value"
-}
-
-validate_key_line() {
-  line="$1"
-  type="$(printf '%s\n' "$line" | awk '{print $1}')"
-  case "$type" in
-    ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)
-      ;;
-    *)
-      die "unsupported or malformed public key type: $type"
-      ;;
-  esac
-
-  # Forbid authorized_keys option prefixes in JSON. sftpctl owns all options.
-  [ "$(printf '%s\n' "$line" | awk '{print NF}')" -ge 2 ] \
-    || die "malformed public key"
-}
+#
+# -------------------------------
+# JSON validation
+# -------------------------------
+#
 
 validate_client_file() {
   file="$1"
 
-  jq -e '
-    type == "object" and
-    ((keys - ["user","enabled","port","max_file_mb","allowed_ips","public_keys"]) | length == 0) and
-    (.user | type == "string") and
-    (.enabled | type == "boolean") and
-    (.port | type == "number" and floor == .) and
-    (.max_file_mb | type == "number" and floor == . and . > 0) and
-    (.allowed_ips | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) and
-    (.public_keys | type == "array" and length > 0 and all(.[]; type == "string" and length > 0))
-  ' "$file" >/dev/null || die "$file: invalid schema"
+  [ -f "$file" ] || {
+    echo "$file: file not found" >&2
+    return 1
+  }
+
+  if ! jq -e '
+    type == "object"
+    and
+    (
+      (keys - [
+        "user",
+        "enabled",
+        "port",
+        "max_file_mb",
+        "allowed_ips",
+        "public_keys"
+      ])
+      | length == 0
+    )
+    and (.user | type == "string" and length > 0)
+    and (.enabled | type == "boolean")
+    and (.port | type == "number" and floor == .)
+    and (.max_file_mb | type == "number" and floor == . and . > 0)
+    and (
+      .allowed_ips
+      | type == "array"
+      and length > 0
+      and all(.[]; type == "string" and length > 0)
+    )
+    and (
+      .public_keys
+      | type == "array"
+      and length > 0
+      and all(.[]; type == "string" and length > 0)
+    )
+  ' "$file" >/dev/null
+  then
+    echo "$file: invalid schema" >&2
+    return 1
+  fi
 
   user="$(jq -r '.user' "$file")"
-  valid_user "$user" || die "$file: invalid user: $user"
 
-  base="$(basename "$file" .json)"
-  [ "$base" = "$user" ] || die "$file: filename must be ${user}.json"
+  if ! printf '%s' "$user" \
+      | grep -Eq '^[a-z_][a-z0-9_-]{0,30}$'
+  then
+    echo "$file: invalid username: $user" >&2
+    return 1
+  fi
+
+  expected="${user}.json"
+
+  if [ "$(basename "$file")" != "$expected" ]; then
+    echo "$file: filename must be $expected" >&2
+    return 1
+  fi
 
   port="$(jq -r '.port' "$file")"
-  [ "$port" -ge "$PORT_START" ] && [ "$port" -le "$PORT_END" ] \
-    || die "$file: port must be in ${PORT_START}..${PORT_END}"
 
-  # Validate CIDRs/IPs with sshd itself indirectly is awkward in POSIX shell.
-  # Accept only characters valid in common IPv4/IPv6/CIDR forms here.
-  # OpenSSH will reject malformed from= patterns during authentication.
-  jq -r '.allowed_ips[]' "$file" | while IFS= read -r ip; do
-    printf '%s' "$ip" | grep -Eq '^[0-9A-Fa-f:./]+$' \
-      || die "$file: invalid characters in allowed_ip: $ip"
-  done
+  if [ "$port" -lt "$PORT_START" ] \
+      || [ "$port" -gt "$PORT_END" ]
+  then
+    echo \
+      "$file: port must be ${PORT_START}..${PORT_END}" \
+      >&2
 
-  jq -r '.public_keys[]' "$file" | while IFS= read -r key; do
-    validate_key_line "$key"
-  done
+    return 1
+  fi
+
+  return 0
+}
+
+#
+# -------------------------------
+# Shard
+# -------------------------------
+#
+
+get_shard() {
+  port="$1"
+
+  shard=$(( (port - PORT_START) / PORTS_PER_SHARD ))
+
+  if [ "$shard" -lt 0 ] \
+      || [ "$shard" -ge "$SHARD_COUNT" ]
+  then
+    die "invalid shard for port $port"
+  fi
+
+  echo "$shard"
 }
 
 uid_for_port() {
   port="$1"
+
   echo $((UID_BASE + port - PORT_START))
 }
 
+#
+# -------------------------------
+# Linux user
+# -------------------------------
+#
+
 ensure_group() {
-  getent group "$GROUP" >/dev/null 2>&1 || groupadd --system "$GROUP"
+  if ! getent group "$GROUP" >/dev/null 2>&1; then
+    groupadd --system "$GROUP"
+  fi
 }
 
 ensure_user() {
@@ -115,26 +156,42 @@ ensure_user() {
   ensure_group
 
   if id "$user" >/dev/null 2>&1; then
+
     current_uid="$(id -u "$user")"
-    [ "$current_uid" -eq "$uid" ] || die \
-      "$user already exists with uid=$current_uid, expected uid=$uid. Changing a client's port changes its derived UID; migrate deliberately instead."
-    usermod -g "$GROUP" -s /usr/sbin/nologin "$user"
-  else
-    if getent passwd "$uid" >/dev/null 2>&1; then
-      die "uid $uid is already in use"
+
+    if [ "$current_uid" -ne "$uid" ]; then
+      die \
+        "$user exists with uid=$current_uid but expected uid=$uid"
     fi
 
-    useradd \
-      --uid "$uid" \
-      --gid "$GROUP" \
-      --no-create-home \
-      --home-dir / \
-      --shell /usr/sbin/nologin \
+    usermod \
+      -g "$GROUP" \
+      -s /usr/sbin/nologin \
       "$user"
 
-    log "created container-local user $user uid=$uid"
+    return
   fi
+
+  if getent passwd "$uid" >/dev/null 2>&1; then
+    die "uid $uid already exists"
+  fi
+
+  useradd \
+    --uid "$uid" \
+    --gid "$GROUP" \
+    --no-create-home \
+    --home-dir / \
+    --shell /usr/sbin/nologin \
+    "$user"
+
+  log "created user=$user uid=$uid"
 }
+
+#
+# -------------------------------
+# chroot
+# -------------------------------
+#
 
 ensure_chroot() {
   user="$1"
@@ -145,18 +202,30 @@ ensure_chroot() {
 
   mkdir -p "$incoming"
 
+  #
+  # ChrootDirectoryはroot所有必須
+  #
+
   chown root:root "$root"
   chmod 0755 "$root"
 
   gid="$(getent group "$GROUP" | cut -d: -f3)"
+
   chown "$uid:$gid" "$incoming"
   chmod 0700 "$incoming"
 }
 
-write_auth_keys() {
+#
+# -------------------------------
+# authorized_keys
+# -------------------------------
+#
+
+write_authorized_keys() {
   file="$1"
-  user="$2"
-  enabled="$3"
+
+  user="$(jq -r '.user' "$file")"
+  enabled="$(jq -r '.enabled' "$file")"
 
   target="$AUTH_KEYS_DIR/$user"
 
@@ -168,22 +237,52 @@ write_auth_keys() {
   mkdir -p "$AUTH_KEYS_DIR"
 
   ips="$(jq -r '.allowed_ips | join(",")' "$file")"
+
   tmp="${target}.tmp.$$"
 
   : > "$tmp"
-  jq -r '.public_keys[]' "$file" | while IFS= read -r key; do
-    printf 'restrict,from="%s" %s\n' "$ips" "$key" >> "$tmp"
+
+  jq -r '.public_keys[]' "$file" |
+  while IFS= read -r key; do
+
+    case "$key" in
+      ssh-ed25519\ *|\
+      ssh-rsa\ *|\
+      ecdsa-sha2-nistp256\ *|\
+      ecdsa-sha2-nistp384\ *|\
+      ecdsa-sha2-nistp521\ *)
+        ;;
+      *)
+        rm -f "$tmp"
+        die "invalid public key for $user"
+        ;;
+    esac
+
+    printf \
+      'restrict,from="%s" %s\n' \
+      "$ips" \
+      "$key" \
+      >> "$tmp"
+
   done
 
   chown root:root "$tmp"
   chmod 0644 "$tmp"
+
   mv -f "$tmp" "$target"
 }
 
+#
+# -------------------------------
+# RLIMIT_FSIZE
+# -------------------------------
+#
+
 write_limit() {
-  user="$1"
-  max_file_mb="$2"
-  enabled="$3"
+  file="$1"
+
+  user="$(jq -r '.user' "$file")"
+  enabled="$(jq -r '.enabled' "$file")"
 
   target="$LIMITS_DIR/90-sftp-${user}.conf"
 
@@ -192,268 +291,490 @@ write_limit() {
     return
   fi
 
+  max_file_mb="$(jq -r '.max_file_mb' "$file")"
+
+  #
+  # pam_limits fsize = KB
+  #
+
   kb=$((max_file_mb * 1024))
+
   tmp="${target}.tmp.$$"
 
-  printf '%s - fsize %s\n' "$user" "$kb" > "$tmp"
+  printf \
+    '%s - fsize %s\n' \
+    "$user" \
+    "$kb" \
+    > "$tmp"
+
   chmod 0644 "$tmp"
+
   mv -f "$tmp" "$target"
 }
 
-build_rules_candidate() {
-  candidate="$1"
+#
+# -------------------------------
+# sshd config
+# -------------------------------
+#
 
-  {
-    echo "# AUTO-GENERATED BY sftpctl. DO NOT EDIT."
-    echo "# Enabled user/local-port pairs."
-    echo
-  } > "$candidate"
+write_common_config() {
+  output="$1"
+  shard="$2"
 
-  # Validate uniqueness among enabled clients before generating anything.
-  dup_ports="$(
-    for f in "$CLIENT_DIR"/*.json; do
-      [ -e "$f" ] || continue
-      case "$f" in
-        *.example.json) continue ;;
-      esac
-      validate_client_file "$f"
-      enabled="$(jq -r '.enabled' "$f")"
-      [ "$enabled" = "true" ] || continue
-      jq -r '.port' "$f"
-    done | sort | uniq -d
-  )"
+  #
+  # dummy socket
+  #
+  # JSONが0件のshardでもsshdを起動可能にする。
+  #
+  dummy_port=$((22900 + shard))
 
-  [ -z "$dup_ports" ] || die "duplicate enabled port(s): $dup_ports"
+  cat > "$output" <<EOF
+AddressFamily inet
 
-  for f in "$CLIENT_DIR"/*.json; do
-    [ -e "$f" ] || continue
-    case "$f" in
-      *.example.json) continue ;;
+ListenAddress 127.0.0.1:${dummy_port}
+
+UsePAM yes
+
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+
+PermitRootLogin no
+
+AuthorizedKeysFile /etc/sftp/authorized_keys/%u
+
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+GatewayPorts no
+PermitTunnel no
+PermitUserEnvironment no
+PermitUserRC no
+PermitTTY no
+
+MaxSessions 1
+
+LogLevel VERBOSE
+
+HostKey /config/host_keys/ssh_host_ed25519_key
+HostKey /config/host_keys/ssh_host_rsa_key
+
+PidFile /run/sshd/native-${shard}.pid
+
+EOF
+}
+
+build_configs() {
+
+  tmpdir="/run/sshd/new-configs.$$"
+
+  rm -rf "$tmpdir"
+  mkdir -p "$tmpdir"
+
+  #
+  # 10 shard作成
+  #
+
+  shard=0
+
+  while [ "$shard" -lt "$SHARD_COUNT" ]; do
+
+    write_common_config \
+      "$tmpdir/shard-${shard}.conf" \
+      "$shard"
+
+    shard=$((shard + 1))
+  done
+
+  #
+  # port重複チェック
+  #
+
+  ports_file="$tmpdir/ports"
+
+  : > "$ports_file"
+
+  #
+  # ListenAddress追加
+  #
+
+  for file in "$CLIENT_DIR"/*.json; do
+
+    [ -e "$file" ] || continue
+
+    case "$file" in
+      *.example.json)
+        continue
+        ;;
     esac
 
-    validate_client_file "$f"
+    if ! validate_client_file "$file"; then
+      echo \
+        "sftpctl: WARN: skipping invalid config: $file" \
+        >&2
 
-    enabled="$(jq -r '.enabled' "$f")"
+      continue
+    fi
+
+    enabled="$(jq -r '.enabled' "$file")"
+
     [ "$enabled" = "true" ] || continue
 
-    user="$(jq -r '.user' "$f")"
-    port="$(jq -r '.port' "$f")"
+    user="$(jq -r '.user' "$file")"
+    port="$(jq -r '.port' "$file")"
 
-    cat >> "$candidate" <<EOF
-Match User $user LocalPort $port
+    if grep -qx "$port" "$ports_file"; then
+      rm -rf "$tmpdir"
+      die "duplicate port: $port"
+    fi
+
+    echo "$port" >> "$ports_file"
+
+    shard="$(get_shard "$port")"
+
+    config="$tmpdir/shard-${shard}.conf"
+
+    cat >> "$config" <<EOF
+
+ListenAddress 0.0.0.0:${port}
+
+EOF
+
+  done
+
+  #
+  # User + LocalPort allowルール
+  #
+
+  for file in "$CLIENT_DIR"/*.json; do
+
+    [ -e "$file" ] || continue
+
+    case "$file" in
+      *.example.json)
+        continue
+        ;;
+    esac
+
+    validate_client_file "$file" || continue
+
+    enabled="$(jq -r '.enabled' "$file")"
+
+    [ "$enabled" = "true" ] || continue
+
+    user="$(jq -r '.user' "$file")"
+    port="$(jq -r '.port' "$file")"
+
+    shard="$(get_shard "$port")"
+
+    config="$tmpdir/shard-${shard}.conf"
+
+    cat >> "$config" <<EOF
+
+Match User ${user} LocalPort ${port}
     RefuseConnection no
+
 Match all
 
 EOF
+
   done
+
+  #
+  # 全shard共通のdefault deny / SFTP設定
+  #
+
+  shard=0
+
+  while [ "$shard" -lt "$SHARD_COUNT" ]; do
+
+    config="$tmpdir/shard-${shard}.conf"
+
+    cat >> "$config" <<'EOF'
+
+Match Group sftp-clients
+
+    RefuseConnection yes
+
+    ChrootDirectory /data/%u
+
+    ForceCommand internal-sftp -d /incoming -u 077 -l VERBOSE -P remove,rmdir,mkdir,symlink,link,setstat,fsetstat,lsetstat,copy-data
+
+    DisableForwarding yes
+
+    PermitTTY no
+    X11Forwarding no
+    AllowAgentForwarding no
+    AllowTcpForwarding no
+    PermitTunnel no
+
+Match all
+
+EOF
+
+    #
+    # sshd設定チェック
+    #
+
+    if ! /usr/sbin/sshd \
+        -t \
+        -f "$config"
+    then
+      rm -rf "$tmpdir"
+
+      die "sshd -t failed: shard=$shard"
+    fi
+
+    shard=$((shard + 1))
+  done
+
+  #
+  # 全部通ってからatomicに差し替える
+  #
+
+  shard=0
+
+  while [ "$shard" -lt "$SHARD_COUNT" ]; do
+
+    mv \
+      "$tmpdir/shard-${shard}.conf" \
+      "/run/sshd/shard-${shard}.conf"
+
+    shard=$((shard + 1))
+  done
+
+  rm -rf "$tmpdir"
 }
 
-validate_candidate_rules() {
-  candidate="$1"
+#
+# -------------------------------
+# runtime client
+# -------------------------------
+#
 
-  # Validate a temporary complete config whose client Include points at the
-  # candidate file instead of the live one.
-  tmp_config="/run/sshd-config-test.$$"
-
-  sed \
-    "s#^Include /etc/ssh/sshd_config.d/90-clients.conf\$#Include $candidate#" \
-    "$SSHD_CONFIG" > "$tmp_config"
-
-  if ! /usr/sbin/sshd -t -f "$tmp_config"; then
-    rm -f "$tmp_config"
-    die "sshd rejected generated rules; live config unchanged"
-  fi
-
-  rm -f "$tmp_config"
-}
-
-install_rules() {
-  candidate="/run/90-clients.conf.candidate.$$"
-
-  build_rules_candidate "$candidate"
-  validate_candidate_rules "$candidate"
-
-  chmod 0644 "$candidate"
-
-  old=""
-  new="$(cat "$candidate")"
-  [ -f "$CLIENT_RULES" ] && old="$(cat "$CLIENT_RULES")"
-
-  if [ "$old" != "$new" ]; then
-    mv -f "$candidate" "$CLIENT_RULES"
-    echo changed
-  else
-    rm -f "$candidate"
-    echo unchanged
-  fi
-}
-
-apply_file_runtime() {
+apply_runtime() {
   file="$1"
-  validate_client_file "$file"
+
+  validate_client_file "$file" \
+    || die "invalid JSON: $file"
 
   user="$(jq -r '.user' "$file")"
-  enabled="$(jq -r '.enabled' "$file")"
   port="$(jq -r '.port' "$file")"
-  max_file_mb="$(jq -r '.max_file_mb' "$file")"
+
   uid="$(uid_for_port "$port")"
 
-  ensure_user "$user" "$uid"
-  ensure_chroot "$user" "$uid"
-  write_auth_keys "$file" "$user" "$enabled"
-  write_limit "$user" "$max_file_mb" "$enabled"
+  ensure_user \
+    "$user" \
+    "$uid"
+
+  ensure_chroot \
+    "$user" \
+    "$uid"
+
+  write_authorized_keys "$file"
+  write_limit "$file"
 }
 
-reload_sshd_if_running() {
-  # -o selects the oldest process. With sshd as container PID 1 this finds the
-  # listener, not a per-connection child.
-  pid="$(pgrep -xo sshd 2>/dev/null || true)"
-  [ -n "$pid" ] || return 0
+#
+# -------------------------------
+# reload
+# -------------------------------
+#
 
-  /usr/sbin/sshd -t -f "$SSHD_CONFIG"
-  kill -HUP "$pid"
-  log "reloaded sshd pid=$pid"
+reload_all_sshd() {
+
+  for pidfile in /run/sshd/shard-*.child.pid; do
+
+    [ -e "$pidfile" ] || continue
+
+    pid="$(cat "$pidfile")"
+
+    if kill -0 "$pid" 2>/dev/null; then
+
+      kill -HUP "$pid"
+
+      log "SIGHUP sshd pid=$pid"
+    fi
+
+  done
 }
 
-apply_one_file() {
+#
+# -------------------------------
+# apply single
+# -------------------------------
+#
+
+apply_one() {
   file="$1"
-  [ -f "$file" ] || die "file not found: $file"
 
-  # First validate all JSON/rules so a bad duplicate port does not get
-  # installed into sshd.
-  validate_client_file "$file"
-  candidate="/run/precheck-client-rules.$$"
-  build_rules_candidate "$candidate"
-  validate_candidate_rules "$candidate"
-  rm -f "$candidate"
+  apply_runtime "$file"
 
-  apply_file_runtime "$file"
+  build_configs
 
-  result="$(install_rules)"
-  /usr/sbin/sshd -t -f "$SSHD_CONFIG"
+  reload_all_sshd
 
-  if [ "$result" = "changed" ]; then
-    reload_sshd_if_running
-  fi
-
-  user="$(jq -r '.user' "$file")"
-  log "applied $user"
+  log "applied $(jq -r '.user' "$file")"
 }
+
+#
+# -------------------------------
+# apply all
+# -------------------------------
+#
 
 apply_all() {
-  # Validate every JSON and complete generated sshd config BEFORE modifying
-  # live sshd rules.
-  candidate="/run/precheck-client-rules.$$"
-  build_rules_candidate "$candidate"
-  validate_candidate_rules "$candidate"
-  rm -f "$candidate"
 
-  for f in "$CLIENT_DIR"/*.json; do
-    [ -e "$f" ] || continue
-    case "$f" in
-      *.example.json) continue ;;
+  valid_count=0
+  invalid_count=0
+
+  for file in "$CLIENT_DIR"/*.json; do
+
+    [ -e "$file" ] || continue
+
+    case "$file" in
+      *.example.json)
+        continue
+        ;;
     esac
-    apply_file_runtime "$f"
+
+    if validate_client_file "$file"; then
+
+      apply_runtime "$file"
+
+      valid_count=$((valid_count + 1))
+
+    else
+
+      echo \
+        "sftpctl: WARN: invalid client ignored: $file" \
+        >&2
+
+      invalid_count=$((invalid_count + 1))
+
+    fi
+
   done
 
-  result="$(install_rules)"
-  /usr/sbin/sshd -t -f "$SSHD_CONFIG"
+  build_configs
 
-  if [ "$result" = "changed" ]; then
-    reload_sshd_if_running
-  fi
+  reload_all_sshd
 
-  log "applied all client JSON files"
+  log \
+    "apply-all completed valid=$valid_count invalid=$invalid_count"
 }
 
-show_client() {
-  name="$1"
-  file="$CLIENT_DIR/$name.json"
-  [ -f "$file" ] || die "client not found: $name"
-  jq . "$file"
-}
+#
+# -------------------------------
+# status
+# -------------------------------
+#
 
 status_client() {
-  name="$1"
-  file="$CLIENT_DIR/$name.json"
-  [ -f "$file" ] || die "client not found: $name"
 
-  validate_client_file "$file"
+  name="$1"
+
+  file="$CLIENT_DIR/$name.json"
+
+  [ -f "$file" ] \
+    || die "not found: $name"
+
+  validate_client_file "$file" \
+    || die "invalid config"
 
   user="$(jq -r '.user' "$file")"
   port="$(jq -r '.port' "$file")"
+  shard="$(get_shard "$port")"
 
-  echo "JSON:"
-  jq . "$file"
+  echo "user:  $user"
+  echo "port:  $port"
+  echo "shard: $shard"
   echo
+
   echo "Linux user:"
   getent passwd "$user" || true
-  echo
-  echo "Authorized keys:"
-  if [ -f "$AUTH_KEYS_DIR/$user" ]; then
-    sed -E 's/(ssh-[^ ]+|ecdsa-[^ ]+) [A-Za-z0-9+\/=]+/\1 <REDACTED>/' "$AUTH_KEYS_DIR/$user"
-  else
-    echo "(none)"
-  fi
+
   echo
   echo "PAM limit:"
-  cat "$LIMITS_DIR/90-sftp-${user}.conf" 2>/dev/null || echo "(none)"
+
+  cat \
+    "$LIMITS_DIR/90-sftp-${user}.conf" \
+    2>/dev/null \
+    || echo "(none)"
+
   echo
-  echo "Effective sshd settings for configured local port:"
-  /usr/sbin/sshd -T \
-    -C "user=$user,host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=$port" \
-    | grep -E '^(refuseconnection|chrootdirectory|forcecommand|disableforwarding|permittty) ' \
+  echo "sshd listener:"
+
+  grep \
+    "^ListenAddress " \
+    "/run/sshd/shard-${shard}.conf" \
     || true
 }
 
-usage() {
-  cat <<'EOF'
+#
+# -------------------------------
+# main
+# -------------------------------
+#
+
+require_root
+
+command="${1:-}"
+
+case "$command" in
+
+  apply)
+
+    [ "$#" -eq 2 ] \
+      || die "usage: sftpctl apply <client>"
+
+    apply_one \
+      "$CLIENT_DIR/$2.json"
+    ;;
+
+  apply-file)
+
+    [ "$#" -eq 2 ] \
+      || die "usage: sftpctl apply-file <path>"
+
+    apply_one "$2"
+    ;;
+
+  apply-all)
+
+    apply_all
+    ;;
+
+  status)
+
+    [ "$#" -eq 2 ] \
+      || die "usage: sftpctl status <client>"
+
+    status_client "$2"
+    ;;
+
+  show)
+
+    [ "$#" -eq 2 ] \
+      || die "usage: sftpctl show <client>"
+
+    jq . "$CLIENT_DIR/$2.json"
+    ;;
+
+  *)
+
+    cat <<'EOF'
 Usage:
-  sftpctl apply <client-name>
-  sftpctl apply-file <json-path>
-  sftpctl apply-all
-  sftpctl show <client-name>
-  sftpctl status <client-name>
 
-Examples:
-  sftpctl apply client001
-  sftpctl apply-file /config/clients/client001.json
+  sftpctl apply <client>
+  sftpctl apply-file <json>
   sftpctl apply-all
+  sftpctl status <client>
+  sftpctl show <client>
+
 EOF
-}
+    ;;
 
-main() {
-  require_root
-
-  cmd="${1:-}"
-  case "$cmd" in
-    apply)
-      [ "$#" -eq 2 ] || die "usage: sftpctl apply <client-name>"
-      apply_one_file "$CLIENT_DIR/$2.json"
-      ;;
-    apply-file)
-      [ "$#" -eq 2 ] || die "usage: sftpctl apply-file <json-path>"
-      apply_one_file "$2"
-      ;;
-    apply-all)
-      [ "$#" -eq 1 ] || die "usage: sftpctl apply-all"
-      apply_all
-      ;;
-    show)
-      [ "$#" -eq 2 ] || die "usage: sftpctl show <client-name>"
-      show_client "$2"
-      ;;
-    status)
-      [ "$#" -eq 2 ] || die "usage: sftpctl status <client-name>"
-      status_client "$2"
-      ;;
-    ""|-h|--help|help)
-      usage
-      ;;
-    *)
-      die "unknown command: $cmd"
-      ;;
-  esac
-}
-
-main "$@"
+esac
